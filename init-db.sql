@@ -1,0 +1,2 @@
+CREATE DATABASE IF NOT EXISTS `wordie_anki`;
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'%';
