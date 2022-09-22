@@ -1,0 +1,20 @@
+[package]
+name = "wordie_benchmark"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4.17"
+env_logger = "0.9.0"
+mysql = "22.2.0"
+csv = "1.1.6"
+serde = { version = "1.0.55", features = ["derive"] }
+uuid = { version = "1.1.2", features=["v4", "serde"] }
+mysql_common = { version = "0.28.0", features=["chrono"] }
+chrono = "0.4.22"
+lazy_static = "1.4.0"
+rand = "0.8.5"
+charabia = "0.6.0"
+wordie_srs = { path = "../wordie_srs" }

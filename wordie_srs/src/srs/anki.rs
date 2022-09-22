@@ -30,7 +30,7 @@ const HARD_INTERVAL: f64 = 1.2;
 
 /// An srs card
 struct Card {
-    sentence_id: String,
+    id: String,
     due: Option<NaiveDateTime>,
     interval: Option<Duration>,
     review_count: i32,
@@ -40,9 +40,9 @@ struct Card {
 type CardRecord = (Option<NaiveDateTime>, Option<Duration>, i32, f32);
 
 impl Card {
-    fn new(sentence_id: String, (due, interval, review_count, ease): CardRecord) -> Self {
+    fn new(id: String, (due, interval, review_count, ease): CardRecord) -> Self {
         Self {
-            sentence_id,
+            id,
             due,
             interval,
             review_count,
@@ -165,7 +165,7 @@ impl AnkiSrsAlgorithm {
               SET cards.due = :due, cards.interval = :interval, cards.review_count = :review_count, cards.ease = :ease
               WHERE cards.sentence_id = :sentence_id",
               params! {
-                "sentence_id" => card.sentence_id,
+                "sentence_id" => card.id,
                 "due" => card.due.unwrap(),
                 "interval" => card.interval.unwrap(),
                 "review_count" => card.review_count,
@@ -174,10 +174,67 @@ impl AnkiSrsAlgorithm {
 
         Ok(())
     }
+
+    fn get_next_due(&self) -> SrsResult<Option<Review>> {
+        let mut conn = self.pool.get_conn()?;
+
+        let midnight = (self.local_time + chrono::Duration::days(1))
+            .with_hour(0).unwrap()
+            .with_minute(0).unwrap()
+            .with_second(0).unwrap()
+            .with_nanosecond(0).unwrap();
+
+        let result = conn.exec_first(
+            r"SELECT cards.sentence_id, sentences.text
+              FROM cards
+              INNER JOIN sentences ON cards.sentence_id = sentences.id
+              WHERE cards.due IS NOT NULL AND cards.due < :latest_time
+              ORDER BY cards.due, cards.added_order ASC
+              LIMIT 1",
+            params! {
+                "latest_time" => midnight.naive_utc()
+            })?
+            .map(|(id, text): (String, String)| {
+                Review::Due(Sentence {
+                    id: Uuid::from_str(&id).unwrap(),
+                    text
+                })
+            });
+
+        let results = result.iter().next().map(|review| review.clone());
+
+        Ok(results)
+    }
+
+    fn get_next_new(&self) -> SrsResult<Option<Review>> {
+        if self.cards_learnt_today >= self.new_card_limit {
+            return Ok(None);
+        }
+
+        let mut conn = self.pool.get_conn()?;
+
+        let result = conn.query_map(
+            r"SELECT cards.sentence_id, sentences.text
+              FROM cards
+              INNER JOIN sentences ON cards.sentence_id = sentences.id
+              WHERE cards.due IS NULL
+              ORDER BY cards.added_order ASC
+              LIMIT 1",
+            |(id, text): (String, String)| {
+                Review::New(Sentence {
+                    id: Uuid::from_str(&id).unwrap(),
+                    text
+                })
+            })?;
+
+        Ok(result.into_iter().next())
+    }
 }
 
 impl SrsAlgorithm for AnkiSrsAlgorithm {
     fn reinitialize_db(&mut self) -> SrsResult<()> {
+        log::info!("Reinitializing database");
+
         // Drop all tables
         self.pool.get_conn()?.query_drop("DROP TABLE IF EXISTS sentences, cards")?;
 
@@ -186,7 +243,7 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
     }
 
     fn initialize_db(&mut self) -> SrsResult<()> {
-        log::info!("Reinitializing database");
+        log::info!("Initializing database");
 
         let mut conn = self.pool.get_conn()?;
 
@@ -194,7 +251,6 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
         conn.query_drop(r"
             CREATE TABLE IF NOT EXISTS sentences (
                 `id` CHAR(36) NOT NULL,
-                `word` TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
                 `text` TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
                 PRIMARY KEY (`id`)
             )
@@ -204,7 +260,7 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
             CREATE TABLE IF NOT EXISTS cards (
                 `sentence_id` CHAR(36) NOT NULL,
                 `review_count` INT NOT NULL,
-                `ease` DECIMAL NOT NULL,
+                `ease` FLOAT NOT NULL,
                 `interval` TIME,
                 `due` DATETIME,
                 `added_order` INT NOT NULL,
@@ -221,12 +277,11 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
         let mut conn = self.pool.get_conn()?;
 
         conn.exec_batch(
-            r"INSERT INTO sentences (id, text, word)
-              VALUES (:id, :text, :word)",
+            r"INSERT INTO sentences (id, text)
+              VALUES (:id, :text)",
             sentences.iter().map(|s| params! {
                 "id" => s.id.to_string(),
-                "text" => &s.text,
-                "word" => &s.word,
+                "text" => &s.text
             })
         )?;
 
@@ -244,59 +299,8 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
         Ok(())
     }
 
-    fn get_next_due(&self) -> SrsResult<Option<Review>> {
-        let mut conn = self.pool.get_conn()?;
-
-        let midnight = (self.local_time + chrono::Duration::days(1))
-            .with_hour(0).unwrap()
-            .with_minute(0).unwrap()
-            .with_second(0).unwrap()
-            .with_nanosecond(0).unwrap();
-
-        let result = conn.exec_first(
-            r"SELECT cards.sentence_id, sentences.text, sentences.word
-              FROM cards
-              INNER JOIN sentences ON cards.sentence_id = sentences.id
-              WHERE cards.due IS NOT NULL AND cards.due < :latest_time
-              ORDER BY cards.due, cards.added_order ASC
-              LIMIT 1",
-            params! {
-                "latest_time" => midnight.naive_utc()
-            })?
-            .map(|(id, text, word): (String, String, String)| {
-                Review::Due(Sentence {
-                    id: Uuid::from_str(&id).unwrap(),
-                    text,
-                    word
-                })
-            });
-
-        Ok(result.into_iter().next())
-    }
-
-    fn get_next_new(&self) -> SrsResult<Option<Review>> {
-        if self.cards_learnt_today >= self.new_card_limit {
-            return Ok(None);
-        }
-
-        let mut conn = self.pool.get_conn()?;
-
-        let result = conn.query_map(
-            r"SELECT cards.sentence_id, sentences.text, sentences.word
-              FROM cards
-              INNER JOIN sentences ON cards.sentence_id = sentences.id
-              WHERE cards.due IS NULL
-              ORDER BY cards.added_order ASC
-              LIMIT 1",
-            |(id, text, word): (String, String, String)| {
-                Review::New(Sentence {
-                    id: Uuid::from_str(&id).unwrap(),
-                    text,
-                    word
-                })
-            })?;
-
-        Ok(result.into_iter().next())
+    fn get_next_card(&self) -> SrsResult<Option<Review>> {
+        Ok(self.get_next_new()?.or(self.get_next_due()?))
     }
 
     // TODO: might be better if we get the record that matches the review from the database,
@@ -330,5 +334,9 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
     fn set_time_now(&mut self, time: DateTime<Local>) {
         log::info!("Setting current time to {time:?}");
         self.local_time = time;
+    }
+
+    fn cards_learnt_today(&self) -> i32 {
+        self.cards_learnt_today
     }
 }

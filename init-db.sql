@@ -1,2 +1,3 @@
 CREATE DATABASE IF NOT EXISTS `wordie_anki`;
-GRANT ALL PRIVILEGES ON *.* TO 'root'@'%';
+CREATE DATABASE IF NOT EXISTS `wordie_wordie`;
+GRANT ALL ON *.* TO 'root'@'%';
