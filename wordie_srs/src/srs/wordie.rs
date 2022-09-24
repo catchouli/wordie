@@ -30,6 +30,9 @@ const EASY_BONUS: f64 = 1.3;
 /// The hard interval
 const HARD_INTERVAL: f64 = 1.2;
 
+/// The max number of cards in learning state at once
+const MAX_LEARNING_CARDS: i32 = 10;
+
 /// A card
 #[derive(Debug)]
 struct Card {
@@ -117,7 +120,8 @@ pub struct WordieSrsAlgorithm {
     pool: Pool,
     new_card_limit: i32,
     // TODO: should store this in db, or it doesn't persist app restarts
-    cards_learnt_today: i32,
+    cards_learned_today: i32,
+    cards_reviewed_today: i32,
     local_time: DateTime<Local>,
 }
 
@@ -129,12 +133,13 @@ impl WordieSrsAlgorithm {
         Ok(WordieSrsAlgorithm {
             pool,
             new_card_limit,
-            cards_learnt_today: 0,
+            cards_learned_today: 0,
+            cards_reviewed_today: 0,
             local_time: Local::now(),
         })
     }
 
-    fn get_next_due_word(&self) -> SrsResult<Option<String>> {
+    fn get_next_due(&self) -> SrsResult<Option<Review>> {
         let mut conn = self.pool.get_conn()?;
 
         let midnight = (self.local_time + chrono::Duration::days(1))
@@ -143,37 +148,114 @@ impl WordieSrsAlgorithm {
             .with_second(0).unwrap()
             .with_nanosecond(0).unwrap();
 
-        let result = conn.exec_first(
-            r"SELECT cards.word_id
-              FROM cards
-              INNER JOIN words ON cards.word_id = words.id
-              WHERE cards.due IS NOT NULL AND cards.due < :latest_time
-              ORDER BY cards.due, cards.added_order ASC
-              LIMIT 1",
+        let result = conn.exec_map(
+            r"
+                -- Find a sentence to review: Get all the sentences with words due today, and order them
+                -- by how many words in each one are due today to find the one most worth reviewing
+                SELECT sentence_words.sentence_id, sentences.text, count(cards.word_id) as words_due
+                FROM cards
+                INNER JOIN sentence_words ON sentence_words.word_id = cards.word_id
+                LEFT JOIN (
+                    -- Get all the sentences with unlearned words
+                    SELECT DISTINCT sentence_words.sentence_id
+                    FROM sentence_words
+                    INNER JOIN cards ON sentence_words.word_id = cards.word_id
+                    WHERE cards.due IS NULL
+                ) sentences_with_unlearned_words ON sentences_with_unlearned_words.sentence_id = sentence_words.sentence_id
+                INNER JOIN sentences ON sentences.id = sentence_words.sentence_id
+                WHERE sentences_with_unlearned_words.sentence_id IS NULL
+                   && cards.due IS NOT NULL
+                   && cards.due < :latest_time
+                GROUP BY sentence_words.sentence_id
+                ORDER BY words_due DESC
+                LIMIT 1
+            ",
             params! {
                 "latest_time" => midnight.naive_utc()
+            },
+            |(sentence_id, text, words_due) : (String, String, i32)| {
+                Review::Due {
+                    sentence: Sentence {
+                        id: Uuid::from_str(sentence_id.as_str()).unwrap(),
+                        text,
+                    },
+                    words_due,
+                }
             })?;
 
         Ok(result.into_iter().next())
     }
 
-    fn get_next_new_word(&self) -> SrsResult<Option<String>> {
-        if self.cards_learnt_today >= self.new_card_limit {
-            log::info!("at new word limit, cards learnt: {}, limit: {}", self.cards_learnt_today, self.new_card_limit);
+    fn get_next_new(&self) -> SrsResult<Option<Review>> {
+        // If there are too many cards in learning, let user do some reviews first
+        let learning_count = self.cards_in_learning_count()?;
+        if learning_count >= MAX_LEARNING_CARDS {
+            log::info!("Too many cards in learning ({learning_count}) to get a new card");
+            return Ok(None);
+        }
+        else {
+            log::info!("Only ({learning_count}) cards in learning, getting a new card");
+        }
+
+        if self.cards_learned_today >= self.new_card_limit {
+            log::info!("at new word limit, cards learned: {}, limit: {}", self.cards_learned_today, self.new_card_limit);
             return Ok(None);
         }
 
         let mut conn = self.pool.get_conn()?;
 
-        let result = conn.query_first(
-            r"SELECT cards.word_id
-              FROM cards
-              INNER JOIN words ON cards.word_id = words.id
-              WHERE cards.due IS NULL
-              ORDER BY cards.added_order ASC
-              LIMIT 1")?;
+        let result = conn.query_map(
+            r"
+                -- Find a new sentence to learn: First we get all pairs of (sentence_id, word_id) where word_id
+                -- is an unlearned word. Then we group by the sentence id and count the unknown words in each one
+                -- to find the most i+1 sentence to learn.
+                SELECT sentences_with_unlearned.sentence_id, sentences.text, count(sentences_with_unlearned.word_id)
+                FROM (
+                    -- Get all sentences with unlearned words, along with the unlearned words in them
+                    SELECT sentence_words.sentence_id, cards.word_id
+                    FROM cards
+                    INNER JOIN sentence_words ON sentence_words.word_id = cards.word_id
+                    WHERE cards.due IS NULL
+                    ORDER BY cards.added_order ASC
+                ) sentences_with_unlearned
+                INNER JOIN sentences ON sentences.id = sentences_with_unlearned.sentence_id
+                GROUP BY sentences_with_unlearned.sentence_id
+                ORDER BY count(sentences_with_unlearned.word_id)
+                LIMIT 1
+            ",
+            |(sentence_id, text, unknown_words) : (String, String, i32)| {
+                Review::New {
+                    sentence: Sentence {
+                        id: Uuid::from_str(sentence_id.as_str()).unwrap(),
+                        text,
+                    },
+                    unknown_words,
+                }
+            })?;
 
         Ok(result.into_iter().next())
+    }
+
+    fn cards_in_learning_count(&self) -> SrsResult<i32> {
+        let mut conn = self.pool.get_conn()?;
+
+        let midnight = (self.local_time + chrono::Duration::days(1))
+            .with_hour(0).unwrap()
+            .with_minute(0).unwrap()
+            .with_second(0).unwrap()
+            .with_nanosecond(0).unwrap();
+
+        Ok(conn.exec_first(
+            r"SELECT count(*)
+              FROM cards
+              WHERE cards.review_count < :max_review_count
+                 && cards.due IS NOT NULL
+                 && cards.due < :latest_time",
+            params! {
+                "max_review_count" => INITIAL_INTERVALS.len(),
+                "latest_time" => midnight.naive_utc(),
+            })?
+            .unwrap_or(0))
     }
 }
 
@@ -182,7 +264,7 @@ impl SrsAlgorithm for WordieSrsAlgorithm {
         log::info!("Reinitializing database");
 
         // Drop all tables
-        self.pool.get_conn()?.query_drop("DROP TABLE IF EXISTS sentence_words, cards, sentences, words")?;
+        self.pool.get_conn()?.query_drop("DROP TABLE IF EXISTS sentence_words, cards, sentences, words, reviews")?;
 
         // Initialise db
         self.initialize_db()
@@ -233,6 +315,14 @@ impl SrsAlgorithm for WordieSrsAlgorithm {
             )
         ")?;
 
+        conn.query_drop(r"
+            CREATE TABLE IF NOT EXISTS reviews (
+                word_id CHAR(36) NOT NULL,
+                review_date DATETIME NOT NULL,
+                FOREIGN KEY (word_id) REFERENCES words(id)
+            )
+        ")?;
+
         Ok(())
     }
 
@@ -243,7 +333,7 @@ impl SrsAlgorithm for WordieSrsAlgorithm {
 
     fn reset_daily_limits(&mut self) {
         log::info!("Resetting daily card limits");
-        self.cards_learnt_today = 0;
+        self.cards_learned_today = 0;
     }
 
     fn add_sentences(&mut self, sentences: &[super::Sentence]) -> SrsResult<()> {
@@ -321,38 +411,10 @@ impl SrsAlgorithm for WordieSrsAlgorithm {
     }
 
     fn get_next_card(&self) -> SrsResult<Option<super::Review>> {
-        let next_card = self.get_next_due_word()?.map(|word_id| (word_id, false))
-            .or(self.get_next_new_word()?.map(|word_id| (word_id, true)));
+        let next_card = self.get_next_new()?
+            .or(self.get_next_due()?);
 
-        if let Some((word_id, new)) = next_card {
-            log::info!("next word: {word_id:?}");
-            let mut conn = self.pool.get_conn()?;
-
-            let sentence = conn.exec_map(
-                r"SELECT sentence_words.sentence_id, sentences.text
-                  FROM sentence_words
-                  INNER JOIN sentences ON sentence_words.sentence_id = sentences.id
-                  WHERE word_id = :word_id
-                  GROUP BY sentence_id
-                  LIMIT 1",
-                params! { word_id },
-                |(sentence_id, text) : (String, String)| Sentence {
-                    id: Uuid::from_str(sentence_id.as_str()).unwrap(),
-                    text,
-                })?
-                .into_iter()
-                .next();
-
-            if new {
-                Ok(sentence.map(|s| Review::New(s)))
-            }
-            else {
-                Ok(sentence.map(|s| Review::Due(s)))
-            }
-        }
-        else {
-            Ok(None)
-        }
+        Ok(next_card)
     }
 
     fn review(&mut self, review: super::Review, score: super::Difficulty) -> SrsResult<()> {
@@ -375,10 +437,13 @@ impl SrsAlgorithm for WordieSrsAlgorithm {
 
         // Mark each word as reviewed
         for card in cards.iter_mut() {
+            // Increment reviewed count
+            self.cards_reviewed_today += 1;
+
             // If this is a new card, increment new cards count
             if card.due.is_none() {
                 log::info!("Learnt new card");
-                self.cards_learnt_today += 1;
+                self.cards_learned_today += 1;
             }
 
             // Review card
@@ -404,7 +469,52 @@ impl SrsAlgorithm for WordieSrsAlgorithm {
         Ok(())
     }
 
-    fn cards_learnt_today(&self) -> i32 {
-        self.cards_learnt_today
+    fn cards_learned_today(&self) -> i32 {
+        self.cards_learned_today
+    }
+
+    fn cards_reviewed_today(&self) -> i32 {
+        self.cards_reviewed_today
+    }
+
+    fn get_suggested_sentences(&self, new_word_limit: i32) -> SrsResult<Vec<(Sentence, Vec<String>)>> {
+        let mut conn = self.pool.get_conn()?;
+
+        log::info!("Getting recommended i+{new_word_limit} sentences");
+
+        let res: Vec<(String, String, String)> = conn.query(
+            format!(r"
+                -- Get a list of sentences and unknown words for sentences that are up to i+n
+                SELECT sentences.id, sentences.text, words.word
+                FROM (
+                    SELECT sentence_words.sentence_id, count(sentence_words.word_id) as unknown_words
+                    FROM cards
+                    INNER JOIN sentence_words ON sentence_words.word_id = cards.word_id
+                    WHERE cards.due IS NULL
+                    GROUP BY sentence_words.sentence_id
+                ) unlearned_sentences
+                INNER JOIN sentence_words ON sentence_words.sentence_id = unlearned_sentences.sentence_id
+                INNER JOIN sentences ON sentences.id = unlearned_sentences.sentence_id
+                INNER JOIN words ON words.id = sentence_words.word_id
+                INNER JOIN cards ON cards.word_id = sentence_words.word_id
+                WHERE unlearned_sentences.unknown_words <= {new_word_limit}
+                   && cards.due IS NULL
+                ORDER BY unlearned_sentences.unknown_words
+            "))?;
+
+        let mut ret = Vec::new();
+        let mut last_sentence_id: Option<String> = None;
+
+        for (sentence_id, sentence_text, word) in res.iter() {
+            if last_sentence_id.is_none() || last_sentence_id.as_ref().unwrap() != sentence_id {
+                let sentence = Sentence { id: Uuid::from_str(sentence_id.as_str()).unwrap(), text: sentence_text.clone() };
+                ret.push((sentence, Vec::new()));
+                last_sentence_id = Some(sentence_id.clone());
+            }
+
+            ret.last_mut().unwrap().1.push(word.clone());
+        };
+
+        Ok(ret)
     }
 }

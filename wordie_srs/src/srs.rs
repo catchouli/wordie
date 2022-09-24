@@ -4,28 +4,29 @@ pub mod wordie;
 use chrono::{Local, DateTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use strum_macros::EnumIter;
 
 /// A result type that boxes errors to a Box<dyn Error>
-type SrsResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type SrsResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Type for a review
 #[derive(Debug, Clone)]
 pub enum Review {
-    New(Sentence),
-    Due(Sentence),
+    New { sentence: Sentence, unknown_words: i32 },
+    Due { sentence: Sentence, words_due: i32 },
 }
 
 impl Review {
     pub fn sentence(&self) -> &Sentence {
         match &self {
-            Review::New(sentence) => &sentence,
-            Review::Due(sentence) => &sentence,
+            Review::New { sentence, .. } => &sentence,
+            Review::Due { sentence, ..} => &sentence,
         }
     }
 }
 
 /// Review difficulties
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, EnumIter)]
 pub enum Difficulty {
     Again = 0,
     Hard = 1,
@@ -57,12 +58,18 @@ pub trait SrsAlgorithm {
     /// Complete a review
     fn review(&mut self, review: Review, difficulty: Difficulty) -> SrsResult<()>;
 
-    /// Get the number of cards learnt today
-    fn cards_learnt_today(&self) -> i32;
+    /// Get the number of cards learned today
+    fn cards_learned_today(&self) -> i32;
+
+    /// Get the number of cards reviewed today
+    fn cards_reviewed_today(&self) -> i32;
 
     /// Reset daily limits
     fn reset_daily_limits(&mut self);
 
     /// Set the current time
     fn set_time_now(&mut self, time: DateTime<Local>);
+
+    /// Get suggested sentences by new word limit
+    fn get_suggested_sentences(&self, new_word_limit: i32) -> SrsResult<Vec<(Sentence, Vec<String>)>>;
 }

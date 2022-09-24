@@ -1,3 +1,3 @@
 [workspace]
 members = ["wordie_app", "wordie_benchmark", "wordie_srs"]
-default-members = ["wordie_benchmark"]
+default-members = ["wordie_app"]

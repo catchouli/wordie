@@ -5,7 +5,7 @@ use uuid::Uuid;
 use wordie_srs::srs::Sentence;
 
 /// The sentences.csv file
-const CORE_6K: &'static [u8] = include_bytes!("../sentences.csv");
+const CORE_6K: &'static [u8] = include_bytes!("../../resources/sentences.csv");
 
 /// Sentence from the kore 6k sentences.csv, so many columns....
 #[derive(Debug, Serialize, Deserialize)]

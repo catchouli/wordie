@@ -71,7 +71,7 @@ fn simulate<W: Write>(mut srs_algorithm: Box<dyn SrsAlgorithm>, mut writer: W) -
     srs_algorithm.add_sentences(&sentences::core_6k(MAX_SENTENCES)?)?;
 
     // Output header row to writer
-    writeln!(&mut writer, "day,learnt,reviewed")?;
+    writeln!(&mut writer, "day,learned,reviewed")?;
 
     // Do some reviews
     let actual_start = Local::now();
@@ -86,12 +86,12 @@ fn simulate<W: Write>(mut srs_algorithm: Box<dyn SrsAlgorithm>, mut writer: W) -
         loop {
             let next_card = srs_algorithm.get_next_card()?;
 
-            if let Some(review @ Review::New(_)) = next_card {
+            if let Some(review @ Review::New { .. }) = next_card {
                 log::info!("New card: {}", review.sentence().text);
                 srs_algorithm.review(review, random_difficulty())?;
                 review_count += 1;
             }
-            else if let Some(review @ Review::Due(_)) = next_card {
+            else if let Some(review @ Review::Due { .. }) = next_card {
                 log::info!("Due card: {}", review.sentence().text);
                 srs_algorithm.review(review, random_difficulty())?;
                 review_count += 1;
@@ -103,8 +103,8 @@ fn simulate<W: Write>(mut srs_algorithm: Box<dyn SrsAlgorithm>, mut writer: W) -
         }
 
         // Output daily row to writer
-        let learnt = srs_algorithm.cards_learnt_today();
-        writeln!(&mut writer, "{day},{learnt},{review_count}")?;
+        let learned = srs_algorithm.cards_learned_today();
+        writeln!(&mut writer, "{day},{learned},{review_count}")?;
 
         // Reset daily limits and move on to the next day
         srs_algorithm.reset_daily_limits();

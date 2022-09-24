@@ -126,7 +126,8 @@ pub struct AnkiSrsAlgorithm {
     pool: Pool,
     new_card_limit: i32,
     // TODO: should store this in db, or it doesn't persist app restarts
-    cards_learnt_today: i32,
+    cards_learned_today: i32,
+    cards_reviewed_today: i32,
     local_time: DateTime<Local>,
 }
 
@@ -138,7 +139,8 @@ impl AnkiSrsAlgorithm {
         Ok(AnkiSrsAlgorithm {
             pool,
             new_card_limit,
-            cards_learnt_today: 0,
+            cards_learned_today: 0,
+            cards_reviewed_today: 0,
             local_time: Local::now(),
         })
     }
@@ -194,11 +196,12 @@ impl AnkiSrsAlgorithm {
             params! {
                 "latest_time" => midnight.naive_utc()
             })?
-            .map(|(id, text): (String, String)| {
-                Review::Due(Sentence {
+            .map(|(id, text): (String, String)| Review::Due {
+                sentence: Sentence {
                     id: Uuid::from_str(&id).unwrap(),
-                    text
-                })
+                    text,
+                },
+                words_due: 0,
             });
 
         let results = result.iter().next().map(|review| review.clone());
@@ -207,7 +210,7 @@ impl AnkiSrsAlgorithm {
     }
 
     fn get_next_new(&self) -> SrsResult<Option<Review>> {
-        if self.cards_learnt_today >= self.new_card_limit {
+        if self.cards_learned_today >= self.new_card_limit {
             return Ok(None);
         }
 
@@ -220,11 +223,12 @@ impl AnkiSrsAlgorithm {
               WHERE cards.due IS NULL
               ORDER BY cards.added_order ASC
               LIMIT 1",
-            |(id, text): (String, String)| {
-                Review::New(Sentence {
+            |(id, text): (String, String)| Review::New {
+                sentence: Sentence {
                     id: Uuid::from_str(&id).unwrap(),
-                    text
-                })
+                    text,
+                },
+                unknown_words: 0,
             })?;
 
         Ok(result.into_iter().next())
@@ -312,9 +316,12 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
         // Get card to review
         let mut card = self.get_card(&sentence.id.to_string())?;
 
-        // Increment new cards learnt if this is a new card
+        // Increment cards reviewed today
+        self.cards_reviewed_today += 1;
+
+        // Increment new cards learned if this is a new card
         if card.due.is_none() {
-            self.cards_learnt_today += 1;
+            self.cards_learned_today += 1;
         }
 
         // Review card
@@ -328,7 +335,7 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
 
     fn reset_daily_limits(&mut self) {
         log::info!("Resetting daily card limits");
-        self.cards_learnt_today = 0;
+        self.cards_learned_today = 0;
     }
 
     fn set_time_now(&mut self, time: DateTime<Local>) {
@@ -336,7 +343,15 @@ impl SrsAlgorithm for AnkiSrsAlgorithm {
         self.local_time = time;
     }
 
-    fn cards_learnt_today(&self) -> i32 {
-        self.cards_learnt_today
+    fn cards_learned_today(&self) -> i32 {
+        self.cards_learned_today
+    }
+
+    fn cards_reviewed_today(&self) -> i32 {
+        self.cards_reviewed_today
+    }
+
+    fn get_suggested_sentences(&self, _: i32) -> SrsResult<Vec<(Sentence, Vec<String>)>> {
+        Ok(Vec::new())
     }
 }
